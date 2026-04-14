@@ -124,11 +124,20 @@ function slotLabel(dateStr, hour, tz) {
   return `${day}, ${t1} – ${t2}`;
 }
 
-// ─── Sanitize respond.io variables that weren't resolved ─────────────────────
-function resolveVar(value, fallback = "there") {
-  if (!value || value.startsWith("$") || value.startsWith("{{"))
-    return fallback;
-  return value;
+// ─── Fetch contact name from respond.io API ───────────────────────────────────
+async function getContactName(contactId) {
+  try {
+    const res = await respondIO.get(`/contact/id:${contactId}`);
+    const c = res.data?.contact || res.data;
+    // respond.io API returns firstName field
+    const name = c?.firstName || c?.first_name || c?.name;
+    return name && name.trim() ? name.trim() : "there";
+  } catch (err) {
+    console.error(
+      `[getContactName] ERROR: ${err.response?.data ? JSON.stringify(err.response.data) : err.message}`,
+    );
+    return "there";
+  }
 }
 
 // ─── Webhook 1: Fetch Slots ───────────────────────────────────────────────────
@@ -136,11 +145,11 @@ app.post("/webhook/zap1", async (req, res) => {
   res.json({ status: "received" });
 
   const { contact_id } = req.body;
-  const contact_name = resolveVar(req.body.contact_name);
 
   (async () => {
     try {
       const token = await getAccessToken();
+      const contact_name = await getContactName(contact_id);
       const GLOBAL_TZ = "Asia/Dubai";
       const SLOT_HOURS = [10, 11, 12, 13, 14, 15, 16];
       const days = getWorkingDays(GLOBAL_TZ, 3);
@@ -232,7 +241,6 @@ app.post("/webhook/zap2", async (req, res) => {
   res.json({ status: "received" });
 
   const { contact_id, slot_number } = req.body;
-  const contact_name = resolveVar(req.body.contact_name);
   const slotString = req.body["slot_" + slot_number];
 
   (async () => {
@@ -245,6 +253,7 @@ app.post("/webhook/zap2", async (req, res) => {
       }
 
       const [label, slotStart, slotEnd] = slotString.split(" | ");
+      const contact_name = await getContactName(contact_id);
       const token = await getAccessToken();
 
       const calRes = await axios.post(
