@@ -124,11 +124,19 @@ function slotLabel(dateStr, hour, tz) {
   return `${day}, ${t1} – ${t2}`;
 }
 
+// ─── Sanitize respond.io variables that weren't resolved ─────────────────────
+function resolveVar(value, fallback = "there") {
+  if (!value || value.startsWith("$") || value.startsWith("{{"))
+    return fallback;
+  return value;
+}
+
 // ─── Webhook 1: Fetch Slots ───────────────────────────────────────────────────
 app.post("/webhook/zap1", async (req, res) => {
   res.json({ status: "received" });
 
-  const { contact_id, contact_name } = req.body;
+  const { contact_id } = req.body;
+  const contact_name = resolveVar(req.body.contact_name);
 
   (async () => {
     try {
@@ -223,7 +231,8 @@ app.post("/webhook/zap1", async (req, res) => {
 app.post("/webhook/zap2", async (req, res) => {
   res.json({ status: "received" });
 
-  const { contact_id, contact_name, slot_number } = req.body;
+  const { contact_id, slot_number } = req.body;
+  const contact_name = resolveVar(req.body.contact_name);
   const slotString = req.body["slot_" + slot_number];
 
   (async () => {
