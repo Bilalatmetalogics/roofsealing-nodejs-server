@@ -140,6 +140,36 @@ async function getContactName(contactId) {
   }
 }
 
+// ─── Helper: delete a Google Calendar event ──────────────────────────────────
+async function deleteCalendarEvent(eventId, token) {
+  await axios.delete(
+    `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(process.env.CALENDAR_ID)}/events/${eventId}`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  );
+}
+
+// ─── Helper: get contact custom fields ───────────────────────────────────────
+async function getContactFields(contactId) {
+  try {
+    const res = await respondIO.get(`/contact/id:${contactId}`);
+    const c = res.data?.contact || res.data;
+    const fields = {};
+    if (Array.isArray(c?.customFields)) {
+      c.customFields.forEach((f) => {
+        fields[f.name] = f.value;
+      });
+    }
+    if (Array.isArray(c?.custom_fields)) {
+      c.custom_fields.forEach((f) => {
+        fields[f.name] = f.value;
+      });
+    }
+    return fields;
+  } catch (err) {
+    return {};
+  }
+}
+
 // ─── Webhook 1: Fetch Slots ───────────────────────────────────────────────────
 app.post("/webhook/zap1", async (req, res) => {
   res.json({ status: "received" });
@@ -150,6 +180,45 @@ app.post("/webhook/zap1", async (req, res) => {
     try {
       const token = await getAccessToken();
       const contact_name = await getContactName(contact_id);
+
+      // ─── Rebooking detection ──────────────────────────────────────────────
+      const contactFields = await getContactFields(contact_id);
+      const existingEventId = contactFields["calendar_event_id"];
+      const existingLabel = contactFields["booked_slot_label"];
+      const inspectionStatus = contactFields["inspection_status"];
+
+      if (existingEventId && inspectionStatus === "Scheduled") {
+        // Check if the existing event is in the future
+        try {
+          const evCheck = await axios.get(
+            `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(process.env.CALENDAR_ID)}/events/${existingEventId}`,
+            { headers: { Authorization: `Bearer ${token}` } },
+          );
+          const eventStart =
+            evCheck.data?.start?.dateTime || evCheck.data?.start?.date;
+          if (eventStart && new Date(eventStart) > new Date()) {
+            // Future booking exists — ask user what to do
+            await updateContactFields(contact_id, [
+              ["booking_state", "pending_reschedule"],
+            ]);
+            await sendWhatsAppMessage(
+              contact_id,
+              `You already have an inspection booked for 📅 ${existingLabel || "a future date"}.\n\nWould you like to:\n1. *reschedule* — pick a new slot\n2. *cancel* — cancel the booking\n\nReply with *reschedule* or *cancel*.`,
+            );
+            console.log(
+              `[zap1] contact=${contact_id} — existing future booking detected, asked to reschedule/cancel`,
+            );
+            return;
+          }
+        } catch (err) {
+          // Event not found or deleted — proceed normally
+          console.log(
+            `[zap1] contact=${contact_id} — existing event not found, proceeding with new booking`,
+          );
+        }
+      }
+      // ─────────────────────────────────────────────────────────────────────
+
       const GLOBAL_TZ = "Asia/Dubai";
       const SLOT_HOURS = [10, 11, 12, 13, 14, 15, 16];
       const days = getWorkingDays(GLOBAL_TZ, 3);
@@ -289,6 +358,8 @@ app.post("/webhook/zap2", async (req, res) => {
         await updateContactFields(contact_id, [
           ["booking_state", "scheduled"],
           ["inspection_status", "Scheduled"],
+          ["calendar_event_id", calRes.data.id],
+          ["booked_slot_label", label],
         ]);
       } catch (err) {
         console.error(
@@ -300,6 +371,150 @@ app.post("/webhook/zap2", async (req, res) => {
     } catch (err) {
       console.error(
         `[zap2] contact=${contact_id} — ERROR: ${err.response?.data ? JSON.stringify(err.response.data) : err.message}`,
+      );
+    }
+  })();
+});
+
+// ─── Webhook 3: Reschedule ────────────────────────────────────────────────────
+app.post("/webhook/reschedule", async (req, res) => {
+  res.json({ status: "received" });
+
+  const { contact_id } = req.body;
+
+  (async () => {
+    try {
+      const token = await getAccessToken();
+      const contactFields = await getContactFields(contact_id);
+      const existingEventId = contactFields["calendar_event_id"];
+
+      // Delete old calendar event if it exists
+      if (existingEventId) {
+        try {
+          await deleteCalendarEvent(existingEventId, token);
+          console.log(
+            `[reschedule] contact=${contact_id} — deleted event ${existingEventId}`,
+          );
+        } catch (err) {
+          console.error(
+            `[reschedule] contact=${contact_id} — could not delete event: ${err.message}`,
+          );
+        }
+      }
+
+      // Clear old booking fields and send slot list
+      const contact_name = await getContactName(contact_id);
+      const GLOBAL_TZ = "Asia/Dubai";
+      const SLOT_HOURS = [10, 11, 12, 13, 14, 15, 16];
+      const days = getWorkingDays(GLOBAL_TZ, 3);
+
+      const evRes = await axios.get(
+        `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(process.env.CALENDAR_ID)}/events`,
+        {
+          headers: { Authorization: `Bearer ${token}` },
+          params: {
+            timeMin: toUTC(days[0], 0, GLOBAL_TZ),
+            timeMax: toUTC(days[days.length - 1], 23, GLOBAL_TZ),
+            singleEvents: true,
+            orderBy: "startTime",
+          },
+        },
+      );
+
+      const booked = evRes.data.items || [];
+      const slots = [];
+
+      for (const day of days) {
+        for (const hour of SLOT_HOURS) {
+          const start = toUTC(day, hour, GLOBAL_TZ);
+          const end = toUTC(day, hour + 1, GLOBAL_TZ);
+          const busy = booked.some((ev) => {
+            const s =
+              ev.start?.dateTime ||
+              (ev.start?.date ? ev.start.date + "T00:00:00Z" : null);
+            const e =
+              ev.end?.dateTime ||
+              (ev.end?.date ? ev.end.date + "T00:00:00Z" : null);
+            if (!s || !e) return false;
+            return s < end && e > start;
+          });
+          if (!busy)
+            slots.push({ label: slotLabel(day, hour, GLOBAL_TZ), start, end });
+        }
+      }
+
+      const fields = [
+        ["slots_total", slots.length.toString()],
+        ["booking_state", "awaiting_selection"],
+        ["calendar_event_id", ""],
+        ["booked_slot_label", ""],
+        ["inspection_status", ""],
+        ...slots.map((s, i) => [
+          `slot_${i + 1}`,
+          `${s.label} | ${s.start} | ${s.end}`,
+        ]),
+      ];
+      await updateContactFields(contact_id, fields);
+
+      const message =
+        `Here are the available slots for rescheduling:\n\n` +
+        slots.map((s, i) => `${i + 1}. ${s.label}`).join("\n") +
+        `\n\nReply with the *number* of your preferred slot.`;
+      await sendWhatsAppMessage(contact_id, message);
+
+      console.log(
+        `[reschedule] contact=${contact_id} — ${slots.length} slots sent`,
+      );
+    } catch (err) {
+      console.error(
+        `[reschedule] contact=${contact_id} — ERROR: ${err.response?.data ? JSON.stringify(err.response.data) : err.message}`,
+      );
+    }
+  })();
+});
+
+// ─── Webhook 4: Cancel ────────────────────────────────────────────────────────
+app.post("/webhook/cancel", async (req, res) => {
+  res.json({ status: "received" });
+
+  const { contact_id } = req.body;
+
+  (async () => {
+    try {
+      const token = await getAccessToken();
+      const contactFields = await getContactFields(contact_id);
+      const existingEventId = contactFields["calendar_event_id"];
+      const existingLabel = contactFields["booked_slot_label"];
+
+      if (existingEventId) {
+        try {
+          await deleteCalendarEvent(existingEventId, token);
+          console.log(
+            `[cancel] contact=${contact_id} — deleted event ${existingEventId}`,
+          );
+        } catch (err) {
+          console.error(
+            `[cancel] contact=${contact_id} — could not delete event: ${err.message}`,
+          );
+        }
+      }
+
+      await updateContactFields(contact_id, [
+        ["booking_state", "cancelled"],
+        ["inspection_status", "Cancelled"],
+        ["calendar_event_id", ""],
+        ["booked_slot_label", ""],
+      ]);
+
+      await sendWhatsAppMessage(
+        contact_id,
+        `✅ Your inspection booking${existingLabel ? ` for 📅 ${existingLabel}` : ""} has been cancelled.\n\nIf you'd like to book again in the future, just let us know.`,
+      );
+
+      console.log(`[cancel] contact=${contact_id} — booking cancelled`);
+    } catch (err) {
+      console.error(
+        `[cancel] contact=${contact_id} — ERROR: ${err.response?.data ? JSON.stringify(err.response.data) : err.message}`,
       );
     }
   })();
