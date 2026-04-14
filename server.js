@@ -7,7 +7,6 @@ const REQUIRED_ENV_VARS = [
   "GOOGLE_REFRESH_TOKEN",
   "CALENDAR_ID",
   "RESPOND_IO_API_KEY",
-  "PORT",
 ];
 const missingVars = REQUIRED_ENV_VARS.filter((v) => !process.env[v]);
 if (missingVars.length > 0) {
@@ -286,8 +285,9 @@ app.post("/webhook/zap2", async (req, res) => {
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 if (require.main === module) {
-  app.listen(process.env.PORT, () => {
-    console.log(`Server running on port ${process.env.PORT}`);
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
   });
 }
 
