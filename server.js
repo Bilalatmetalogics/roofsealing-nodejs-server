@@ -53,15 +53,51 @@ async function updateContactFields(contactId, fields) {
   });
 }
 
-const app = express();
-app.use(express.json());
+// ─── Fetch contact details from respond.io ────────────────────────────────────
+async function getContactDetails(contactId) {
+  try {
+    const res = await respondIO.get(`/contact/id:${contactId}`);
+    const c = res.data?.contact || res.data;
 
-// ─── Health check ─────────────────────────────────────────────────────────────
-app.get("/", (req, res) => {
-  res.json({ status: "ok", message: "RoofSealing server is running" });
-});
+    const name = c?.firstName || c?.first_name || c?.name;
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+    const fields = {};
+    if (Array.isArray(c?.customFields)) {
+      c.customFields.forEach((f) => {
+        fields[f.name] = f.value;
+      });
+    }
+    if (Array.isArray(c?.custom_fields)) {
+      c.custom_fields.forEach((f) => {
+        fields[f.name] = f.value;
+      });
+    }
+
+    return {
+      name: name && name.trim() ? name.trim() : "there",
+      email: c?.email || fields["email"] || null,
+      fields,
+    };
+  } catch (err) {
+    console.error(
+      `[getContactDetails] ERROR: ${err.response?.data ? JSON.stringify(err.response.data) : err.message}`,
+    );
+    return { name: "there", email: null, fields: {} };
+  }
+}
+
+// ─── Delete a Google Calendar event ──────────────────────────────────────────
+async function deleteCalendarEvent(eventId, token) {
+  await axios.delete(
+    `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(process.env.CALENDAR_ID)}/events/${eventId}`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  );
+}
+
+// ─── Slot calculation helpers ─────────────────────────────────────────────────
+const GLOBAL_TZ = "Asia/Dubai";
+const SLOT_HOURS = [10, 11, 12, 13, 14, 15, 16];
+
 function getWorkingDays(tz, count) {
   const days = [],
     c = new Date();
@@ -101,7 +137,7 @@ function toUTC(dateStr, hour, tz) {
   return new Date(approx.getTime() - (localAsUTC - approx)).toISOString();
 }
 
-function slotLabel(dateStr, hour, tz) {
+function buildSlotLabel(dateStr, hour, tz) {
   const d = new Date(toUTC(dateStr, hour, tz));
   const day = new Intl.DateTimeFormat("en-US", {
     timeZone: tz,
@@ -124,54 +160,65 @@ function slotLabel(dateStr, hour, tz) {
   return `${day}, ${t1} – ${t2}`;
 }
 
-// ─── Fetch contact name from respond.io API ───────────────────────────────────
-async function getContactName(contactId) {
-  try {
-    const res = await respondIO.get(`/contact/id:${contactId}`);
-    const c = res.data?.contact || res.data;
-    // respond.io API returns firstName field
-    const name = c?.firstName || c?.first_name || c?.name;
-    return name && name.trim() ? name.trim() : "there";
-  } catch (err) {
-    console.error(
-      `[getContactName] ERROR: ${err.response?.data ? JSON.stringify(err.response.data) : err.message}`,
-    );
-    return "there";
-  }
-}
+// ─── Fetch available slots from Google Calendar ───────────────────────────────
+async function fetchAvailableSlots(token) {
+  const days = getWorkingDays(GLOBAL_TZ, 3);
 
-// ─── Helper: delete a Google Calendar event ──────────────────────────────────
-async function deleteCalendarEvent(eventId, token) {
-  await axios.delete(
-    `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(process.env.CALENDAR_ID)}/events/${eventId}`,
-    { headers: { Authorization: `Bearer ${token}` } },
+  const evRes = await axios.get(
+    `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(process.env.CALENDAR_ID)}/events`,
+    {
+      headers: { Authorization: `Bearer ${token}` },
+      params: {
+        timeMin: toUTC(days[0], 0, GLOBAL_TZ),
+        timeMax: toUTC(days[days.length - 1], 23, GLOBAL_TZ),
+        singleEvents: true,
+        orderBy: "startTime",
+      },
+    },
   );
-}
 
-// ─── Helper: get contact custom fields ───────────────────────────────────────
-async function getContactFields(contactId) {
-  try {
-    const res = await respondIO.get(`/contact/id:${contactId}`);
-    const c = res.data?.contact || res.data;
-    const fields = {};
-    if (Array.isArray(c?.customFields)) {
-      c.customFields.forEach((f) => {
-        fields[f.name] = f.value;
-      });
-    }
-    if (Array.isArray(c?.custom_fields)) {
-      c.custom_fields.forEach((f) => {
-        fields[f.name] = f.value;
-      });
-    }
-    return fields;
-  } catch (err) {
-    return {};
+  if (evRes.data.error) {
+    throw new Error(`Calendar API error: ${JSON.stringify(evRes.data.error)}`);
   }
+
+  const booked = evRes.data.items || [];
+  const slots = [];
+
+  for (const day of days) {
+    for (const hour of SLOT_HOURS) {
+      const start = toUTC(day, hour, GLOBAL_TZ);
+      const end = toUTC(day, hour + 1, GLOBAL_TZ);
+      const busy = booked.some((ev) => {
+        const s =
+          ev.start?.dateTime ||
+          (ev.start?.date ? ev.start.date + "T00:00:00Z" : null);
+        const e =
+          ev.end?.dateTime ||
+          (ev.end?.date ? ev.end.date + "T00:00:00Z" : null);
+        if (!s || !e) return false;
+        return s < end && e > start;
+      });
+      if (!busy)
+        slots.push({ label: buildSlotLabel(day, hour, GLOBAL_TZ), start, end });
+    }
+  }
+
+  return slots;
 }
 
-// ─── Webhook 1: Fetch Slots ───────────────────────────────────────────────────
-app.post("/webhook/zap1", async (req, res) => {
+// ─── Express app ──────────────────────────────────────────────────────────────
+const app = express();
+app.use(express.json());
+
+// ─── Health check ─────────────────────────────────────────────────────────────
+app.get("/", (_req, res) => {
+  res.json({ status: "ok", message: "RoofSealing booking server is running" });
+});
+
+// ─── POST /webhook/slots — Fetch & send available inspection slots ─────────────
+// Called by: Workflow 1 (Shortcut trigger) when AI Agent confirms booking intent
+// Body: { contact_id }
+app.post("/webhook/slots", async (req, res) => {
   res.json({ status: "received" });
 
   const { contact_id } = req.body;
@@ -179,16 +226,14 @@ app.post("/webhook/zap1", async (req, res) => {
   (async () => {
     try {
       const token = await getAccessToken();
-      const contact_name = await getContactName(contact_id);
+      const contact = await getContactDetails(contact_id);
 
-      // ─── Rebooking detection ──────────────────────────────────────────────
-      const contactFields = await getContactFields(contact_id);
-      const existingEventId = contactFields["calendar_event_id"];
-      const existingLabel = contactFields["booked_slot_label"];
-      const inspectionStatus = contactFields["inspection_status"];
+      // ─── Existing booking detection ───────────────────────────────────────
+      const existingEventId = contact.fields["calendar_event_id"];
+      const existingLabel = contact.fields["booked_slot_label"];
+      const inspectionStatus = contact.fields["inspection_status"];
 
       if (existingEventId && inspectionStatus === "Scheduled") {
-        // Check if the existing event is in the future
         try {
           const evCheck = await axios.get(
             `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(process.env.CALENDAR_ID)}/events/${existingEventId}`,
@@ -197,7 +242,6 @@ app.post("/webhook/zap1", async (req, res) => {
           const eventStart =
             evCheck.data?.start?.dateTime || evCheck.data?.start?.date;
           if (eventStart && new Date(eventStart) > new Date()) {
-            // Future booking exists — ask user what to do
             await updateContactFields(contact_id, [
               ["booking_state", "pending_reschedule"],
             ]);
@@ -206,66 +250,22 @@ app.post("/webhook/zap1", async (req, res) => {
               `You already have an inspection booked for 📅 ${existingLabel || "a future date"}.\n\nWould you like to:\n1. *reschedule* — pick a new slot\n2. *cancel* — cancel the booking\n\nReply with *reschedule* or *cancel*.`,
             );
             console.log(
-              `[zap1] contact=${contact_id} — existing future booking detected, asked to reschedule/cancel`,
+              `[slots] contact=${contact_id} — existing future booking, asked to reschedule/cancel`,
             );
             return;
           }
-        } catch (err) {
-          // Event not found or deleted — proceed normally
+        } catch {
           console.log(
-            `[zap1] contact=${contact_id} — existing event not found, proceeding with new booking`,
+            `[slots] contact=${contact_id} — existing event not found, proceeding`,
           );
         }
       }
       // ─────────────────────────────────────────────────────────────────────
 
-      const GLOBAL_TZ = "Asia/Dubai";
-      const SLOT_HOURS = [10, 11, 12, 13, 14, 15, 16];
-      const days = getWorkingDays(GLOBAL_TZ, 3);
+      const slots = await fetchAvailableSlots(token);
 
-      const evRes = await axios.get(
-        `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(process.env.CALENDAR_ID)}/events`,
-        {
-          headers: { Authorization: `Bearer ${token}` },
-          params: {
-            timeMin: toUTC(days[0], 0, GLOBAL_TZ),
-            timeMax: toUTC(days[days.length - 1], 23, GLOBAL_TZ),
-            singleEvents: true,
-            orderBy: "startTime",
-          },
-        },
-      );
-
-      if (evRes.data.error) {
-        console.error(
-          `[zap1] contact=${contact_id} — ERROR: ${JSON.stringify(evRes.data.error)}`,
-        );
-        return;
-      }
-
-      const booked = evRes.data.items || [];
-      const slots = [];
-
-      for (const day of days) {
-        for (const hour of SLOT_HOURS) {
-          const start = toUTC(day, hour, GLOBAL_TZ);
-          const end = toUTC(day, hour + 1, GLOBAL_TZ);
-          const busy = booked.some((ev) => {
-            const s =
-              ev.start?.dateTime ||
-              (ev.start?.date ? ev.start.date + "T00:00:00Z" : null);
-            const e =
-              ev.end?.dateTime ||
-              (ev.end?.date ? ev.end.date + "T00:00:00Z" : null);
-            if (!s || !e) return false;
-            return s < end && e > start;
-          });
-          if (!busy)
-            slots.push({ label: slotLabel(day, hour, GLOBAL_TZ), start, end });
-        }
-      }
-
-      const fields = [
+      // Store slots in contact fields so agent can reference them by number
+      const fieldUpdates = [
         ["slots_total", slots.length.toString()],
         ["booking_state", "awaiting_selection"],
         ...slots.map((s, i) => [
@@ -274,70 +274,64 @@ app.post("/webhook/zap1", async (req, res) => {
         ]),
       ];
 
-      try {
-        await updateContactFields(contact_id, fields);
-      } catch (err) {
-        console.error(
-          `[zap1] contact=${contact_id} — ERROR updating fields: ${JSON.stringify(err.response?.data) || err.message}`,
-        );
-      }
+      await updateContactFields(contact_id, fieldUpdates);
 
       const message =
-        `Hi ${contact_name || "there"}! Here are our available inspection slots:\n\n` +
+        `Hi ${contact.name}! Here are our available inspection slots:\n\n` +
         slots.map((s, i) => `${i + 1}. ${s.label}`).join("\n") +
         `\n\nReply with the *number* of your preferred slot.`;
 
-      try {
-        await sendWhatsAppMessage(contact_id, message);
-      } catch (err) {
-        console.error(
-          `[zap1] contact=${contact_id} — ERROR sending message: ${JSON.stringify(err.response?.data) || err.message}`,
-        );
-        return;
-      }
+      await sendWhatsAppMessage(contact_id, message);
 
-      console.log(`[zap1] contact=${contact_id} — ${slots.length} slots sent`);
+      console.log(`[slots] contact=${contact_id} — ${slots.length} slots sent`);
     } catch (err) {
       console.error(
-        `[zap1] contact=${contact_id} — ERROR: ${err.response?.data ? JSON.stringify(err.response.data) : err.message}`,
+        `[slots] contact=${contact_id} — ERROR: ${err.response?.data ? JSON.stringify(err.response.data) : err.message}`,
       );
     }
   })();
 });
 
-// ─── Webhook 2: Book Slot ─────────────────────────────────────────────────────
-app.post("/webhook/zap2", async (req, res) => {
+// ─── POST /webhook/book — Create calendar event and confirm booking ────────────
+// Called by: AI Agent directly (Make HTTP Requests action) when user picks a slot
+// Body: { contact_id, slot_number }
+app.post("/webhook/book", async (req, res) => {
   res.json({ status: "received" });
 
   const { contact_id, slot_number } = req.body;
-  const slotString = req.body["slot_" + slot_number];
 
   (async () => {
     try {
+      if (!slot_number) {
+        console.error(
+          `[book] contact=${contact_id} — ERROR: slot_number missing from request`,
+        );
+        return;
+      }
+
+      // Fetch slot data from contact fields (stored by /webhook/slots)
+      const contact = await getContactDetails(contact_id);
+      const slotString = contact.fields[`slot_${slot_number}`];
+
       if (!slotString) {
         console.error(
-          `[zap2] contact=${contact_id} — ERROR: slot_${slot_number} not found in payload`,
+          `[book] contact=${contact_id} — ERROR: slot_${slot_number} not found in contact fields`,
         );
         return;
       }
 
       const [label, slotStart, slotEnd] = slotString.split(" | ");
-      const contact_name = await getContactName(contact_id);
       const token = await getAccessToken();
 
-      // Fetch email for calendar invite
-      const contactFields = await getContactFields(contact_id);
-      const contact_email = contactFields["email"] || null;
-
-      // Build calendar event — add attendee only if email exists
+      // Build calendar event — include attendee if email is available
       const eventBody = {
         summary: "Roof Sealing - Inspection",
-        description: "Booked by: " + contact_name,
+        description: `Booked by: ${contact.name}`,
         start: { dateTime: slotStart, timeZone: "Asia/Dubai" },
         end: { dateTime: slotEnd, timeZone: "Asia/Dubai" },
-        ...(contact_email && {
-          attendees: [{ email: contact_email, displayName: contact_name }],
-          sendUpdates: "all", // sends Google Calendar invite email to attendee
+        ...(contact.email && {
+          attendees: [{ email: contact.email, displayName: contact.name }],
+          sendUpdates: "all",
         }),
       };
 
@@ -349,47 +343,37 @@ app.post("/webhook/zap2", async (req, res) => {
 
       if (calRes.data.error) {
         console.error(
-          `[zap2] contact=${contact_id} — ERROR: ${JSON.stringify(calRes.data.error)}`,
+          `[book] contact=${contact_id} — Calendar ERROR: ${JSON.stringify(calRes.data.error)}`,
         );
         return;
       }
 
-      try {
-        await sendWhatsAppMessage(
-          contact_id,
-          `✅ Your inspection is confirmed!\n\n📅 ${label}\n\n${contact_email ? "A calendar invite has been sent to your email.\n\n" : ""}Our team will be there. If you need to reschedule, please contact us.`,
-        );
-      } catch (err) {
-        console.error(
-          `[zap2] contact=${contact_id} — ERROR: ${JSON.stringify(err.response?.data) || err.message}`,
-        );
-      }
+      await sendWhatsAppMessage(
+        contact_id,
+        `✅ Your inspection is confirmed!\n\n📅 ${label}\n\n${contact.email ? "A calendar invite has been sent to your email.\n\n" : ""}Our team will be there. If you need to reschedule or cancel, just let us know.`,
+      );
 
-      try {
-        await updateContactFields(contact_id, [
-          ["booking_state", "scheduled"],
-          ["inspection_status", "Scheduled"],
-          ["calendar_event_id", calRes.data.id],
-          ["booked_slot_label", label],
-        ]);
-      } catch (err) {
-        console.error(
-          `[zap2] contact=${contact_id} — ERROR: ${JSON.stringify(err.response?.data) || err.message}`,
-        );
-      }
+      await updateContactFields(contact_id, [
+        ["booking_state", "scheduled"],
+        ["inspection_status", "Scheduled"],
+        ["calendar_event_id", calRes.data.id],
+        ["booked_slot_label", label],
+      ]);
 
       console.log(
-        `[zap2] contact=${contact_id} — booked: ${label}${contact_email ? ` | invite sent to ${contact_email}` : " | no email, invite skipped"}`,
+        `[book] contact=${contact_id} — booked: ${label}${contact.email ? ` | invite → ${contact.email}` : " | no email"}`,
       );
     } catch (err) {
       console.error(
-        `[zap2] contact=${contact_id} — ERROR: ${err.response?.data ? JSON.stringify(err.response.data) : err.message}`,
+        `[book] contact=${contact_id} — ERROR: ${err.response?.data ? JSON.stringify(err.response.data) : err.message}`,
       );
     }
   })();
 });
 
-// ─── Webhook 3: Reschedule ────────────────────────────────────────────────────
+// ─── POST /webhook/reschedule — Delete old event and send new slot list ────────
+// Called by: AI Agent directly (Make HTTP Requests action) when user says reschedule
+// Body: { contact_id }
 app.post("/webhook/reschedule", async (req, res) => {
   res.json({ status: "received" });
 
@@ -398,10 +382,10 @@ app.post("/webhook/reschedule", async (req, res) => {
   (async () => {
     try {
       const token = await getAccessToken();
-      const contactFields = await getContactFields(contact_id);
-      const existingEventId = contactFields["calendar_event_id"];
+      const contact = await getContactDetails(contact_id);
+      const existingEventId = contact.fields["calendar_event_id"];
 
-      // Delete old calendar event if it exists
+      // Delete existing calendar event
       if (existingEventId) {
         try {
           await deleteCalendarEvent(existingEventId, token);
@@ -415,70 +399,27 @@ app.post("/webhook/reschedule", async (req, res) => {
         }
       }
 
-      // Clear trigger fields so they can fire again next time
-      // NOTE: do NOT clear reschedule_request here — that would re-trigger Workflow 3
-      // The AI Agent sets it to "yes" each time, which is always a change from ""
+      const slots = await fetchAvailableSlots(token);
 
-      // Clear old booking fields and send slot list
-      const contact_name = await getContactName(contact_id);
-      const GLOBAL_TZ = "Asia/Dubai";
-      const SLOT_HOURS = [10, 11, 12, 13, 14, 15, 16];
-      const days = getWorkingDays(GLOBAL_TZ, 3);
-
-      const evRes = await axios.get(
-        `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(process.env.CALENDAR_ID)}/events`,
-        {
-          headers: { Authorization: `Bearer ${token}` },
-          params: {
-            timeMin: toUTC(days[0], 0, GLOBAL_TZ),
-            timeMax: toUTC(days[days.length - 1], 23, GLOBAL_TZ),
-            singleEvents: true,
-            orderBy: "startTime",
-          },
-        },
-      );
-
-      const booked = evRes.data.items || [];
-      const slots = [];
-
-      for (const day of days) {
-        for (const hour of SLOT_HOURS) {
-          const start = toUTC(day, hour, GLOBAL_TZ);
-          const end = toUTC(day, hour + 1, GLOBAL_TZ);
-          const busy = booked.some((ev) => {
-            const s =
-              ev.start?.dateTime ||
-              (ev.start?.date ? ev.start.date + "T00:00:00Z" : null);
-            const e =
-              ev.end?.dateTime ||
-              (ev.end?.date ? ev.end.date + "T00:00:00Z" : null);
-            if (!s || !e) return false;
-            return s < end && e > start;
-          });
-          if (!busy)
-            slots.push({ label: slotLabel(day, hour, GLOBAL_TZ), start, end });
-        }
-      }
-
-      const fields = [
+      const fieldUpdates = [
         ["slots_total", slots.length.toString()],
         ["booking_state", "awaiting_selection"],
         ["calendar_event_id", ""],
         ["booked_slot_label", ""],
         ["inspection_status", ""],
-        // NOTE: do NOT clear inspection_slot here — Workflow 2 triggers on that field
-        // The new slot number will overwrite it when user picks a new slot
         ...slots.map((s, i) => [
           `slot_${i + 1}`,
           `${s.label} | ${s.start} | ${s.end}`,
         ]),
       ];
-      await updateContactFields(contact_id, fields);
+
+      await updateContactFields(contact_id, fieldUpdates);
 
       const message =
         `Here are the available slots for rescheduling:\n\n` +
         slots.map((s, i) => `${i + 1}. ${s.label}`).join("\n") +
         `\n\nReply with the *number* of your preferred slot.`;
+
       await sendWhatsAppMessage(contact_id, message);
 
       console.log(
@@ -492,7 +433,9 @@ app.post("/webhook/reschedule", async (req, res) => {
   })();
 });
 
-// ─── Webhook 4: Cancel ────────────────────────────────────────────────────────
+// ─── POST /webhook/cancel — Delete event and confirm cancellation ──────────────
+// Called by: AI Agent directly (Make HTTP Requests action) when user says cancel
+// Body: { contact_id }
 app.post("/webhook/cancel", async (req, res) => {
   res.json({ status: "received" });
 
@@ -501,9 +444,9 @@ app.post("/webhook/cancel", async (req, res) => {
   (async () => {
     try {
       const token = await getAccessToken();
-      const contactFields = await getContactFields(contact_id);
-      const existingEventId = contactFields["calendar_event_id"];
-      const existingLabel = contactFields["booked_slot_label"];
+      const contact = await getContactDetails(contact_id);
+      const existingEventId = contact.fields["calendar_event_id"];
+      const existingLabel = contact.fields["booked_slot_label"];
 
       if (existingEventId) {
         try {
@@ -517,9 +460,6 @@ app.post("/webhook/cancel", async (req, res) => {
           );
         }
       }
-
-      // NOTE: do NOT clear cancel_request here — that would re-trigger Workflow 4
-      // NOTE: do NOT clear inspection_slot here — that would trigger Workflow 2
 
       await updateContactFields(contact_id, [
         ["booking_state", "cancelled"],
@@ -545,7 +485,7 @@ app.post("/webhook/cancel", async (req, res) => {
 // ─── Start ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`[startup] RoofSealing booking server running on port ${PORT}`);
 });
 
-module.exports = { app, getWorkingDays, toUTC, slotLabel };
+module.exports = { app, getWorkingDays, toUTC, buildSlotLabel };
