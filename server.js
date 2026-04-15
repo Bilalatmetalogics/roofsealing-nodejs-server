@@ -416,13 +416,8 @@ app.post("/webhook/reschedule", async (req, res) => {
       }
 
       // Clear trigger fields so they can fire again next time
-      try {
-        await updateContactFields(contact_id, [["reschedule_request", ""]]);
-      } catch (err) {
-        console.error(
-          `[reschedule] contact=${contact_id} — could not clear reschedule_request: ${err.message}`,
-        );
-      }
+      // NOTE: do NOT clear reschedule_request here — that would re-trigger Workflow 3
+      // The AI Agent sets it to "yes" each time, which is always a change from ""
 
       // Clear old booking fields and send slot list
       const contact_name = await getContactName(contact_id);
@@ -471,7 +466,8 @@ app.post("/webhook/reschedule", async (req, res) => {
         ["calendar_event_id", ""],
         ["booked_slot_label", ""],
         ["inspection_status", ""],
-        ["inspection_slot", ""],
+        // NOTE: do NOT clear inspection_slot here — Workflow 2 triggers on that field
+        // The new slot number will overwrite it when user picks a new slot
         ...slots.map((s, i) => [
           `slot_${i + 1}`,
           `${s.label} | ${s.start} | ${s.end}`,
@@ -522,21 +518,14 @@ app.post("/webhook/cancel", async (req, res) => {
         }
       }
 
-      // Clear trigger field so it can fire again next time
-      try {
-        await updateContactFields(contact_id, [["cancel_request", ""]]);
-      } catch (err) {
-        console.error(
-          `[cancel] contact=${contact_id} — could not clear cancel_request: ${err.message}`,
-        );
-      }
+      // NOTE: do NOT clear cancel_request here — that would re-trigger Workflow 4
+      // NOTE: do NOT clear inspection_slot here — that would trigger Workflow 2
 
       await updateContactFields(contact_id, [
         ["booking_state", "cancelled"],
         ["inspection_status", "Cancelled"],
         ["calendar_event_id", ""],
         ["booked_slot_label", ""],
-        ["inspection_slot", ""],
       ]);
 
       await sendWhatsAppMessage(
