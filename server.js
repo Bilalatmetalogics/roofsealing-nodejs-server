@@ -97,6 +97,7 @@ async function deleteCalendarEvent(eventId, token) {
 // ─── Slot calculation helpers ─────────────────────────────────────────────────
 const GLOBAL_TZ = "Asia/Dubai";
 const SLOT_HOURS = [10, 11, 12, 13, 14, 15, 16];
+const CALENDAR_TZ = "Asia/Karachi"; // GMT+5 — must match the Google Calendar's timezone setting
 
 function getWorkingDays(tz, count) {
   const days = [],
