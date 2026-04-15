@@ -325,14 +325,25 @@ app.post("/webhook/zap2", async (req, res) => {
       const contact_name = await getContactName(contact_id);
       const token = await getAccessToken();
 
+      // Fetch email for calendar invite
+      const contactFields = await getContactFields(contact_id);
+      const contact_email = contactFields["email"] || null;
+
+      // Build calendar event — add attendee only if email exists
+      const eventBody = {
+        summary: "Roof Sealing - Inspection",
+        description: "Booked by: " + contact_name,
+        start: { dateTime: slotStart, timeZone: "Asia/Dubai" },
+        end: { dateTime: slotEnd, timeZone: "Asia/Dubai" },
+        ...(contact_email && {
+          attendees: [{ email: contact_email, displayName: contact_name }],
+          sendUpdates: "all", // sends Google Calendar invite email to attendee
+        }),
+      };
+
       const calRes = await axios.post(
         `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(process.env.CALENDAR_ID)}/events`,
-        {
-          summary: "Roof Sealing - Inspection",
-          description: "Booked by: " + contact_name,
-          start: { dateTime: slotStart, timeZone: "Asia/Dubai" },
-          end: { dateTime: slotEnd, timeZone: "Asia/Dubai" },
-        },
+        eventBody,
         { headers: { Authorization: `Bearer ${token}` } },
       );
 
@@ -346,7 +357,7 @@ app.post("/webhook/zap2", async (req, res) => {
       try {
         await sendWhatsAppMessage(
           contact_id,
-          `✅ Your inspection is confirmed!\n\n📅 ${label}\n\nOur team will be there. If you need to reschedule, please contact us.`,
+          `✅ Your inspection is confirmed!\n\n📅 ${label}\n\n${contact_email ? "A calendar invite has been sent to your email.\n\n" : ""}Our team will be there. If you need to reschedule, please contact us.`,
         );
       } catch (err) {
         console.error(
@@ -367,7 +378,9 @@ app.post("/webhook/zap2", async (req, res) => {
         );
       }
 
-      console.log(`[zap2] contact=${contact_id} — booked: ${label}`);
+      console.log(
+        `[zap2] contact=${contact_id} — booked: ${label}${contact_email ? ` | invite sent to ${contact_email}` : " | no email, invite skipped"}`,
+      );
     } catch (err) {
       console.error(
         `[zap2] contact=${contact_id} — ERROR: ${err.response?.data ? JSON.stringify(err.response.data) : err.message}`,
@@ -400,6 +413,15 @@ app.post("/webhook/reschedule", async (req, res) => {
             `[reschedule] contact=${contact_id} — could not delete event: ${err.message}`,
           );
         }
+      }
+
+      // Clear trigger fields so they can fire again next time
+      try {
+        await updateContactFields(contact_id, [["reschedule_request", ""]]);
+      } catch (err) {
+        console.error(
+          `[reschedule] contact=${contact_id} — could not clear reschedule_request: ${err.message}`,
+        );
       }
 
       // Clear old booking fields and send slot list
@@ -449,6 +471,7 @@ app.post("/webhook/reschedule", async (req, res) => {
         ["calendar_event_id", ""],
         ["booked_slot_label", ""],
         ["inspection_status", ""],
+        ["inspection_slot", ""],
         ...slots.map((s, i) => [
           `slot_${i + 1}`,
           `${s.label} | ${s.start} | ${s.end}`,
@@ -499,11 +522,21 @@ app.post("/webhook/cancel", async (req, res) => {
         }
       }
 
+      // Clear trigger field so it can fire again next time
+      try {
+        await updateContactFields(contact_id, [["cancel_request", ""]]);
+      } catch (err) {
+        console.error(
+          `[cancel] contact=${contact_id} — could not clear cancel_request: ${err.message}`,
+        );
+      }
+
       await updateContactFields(contact_id, [
         ["booking_state", "cancelled"],
         ["inspection_status", "Cancelled"],
         ["calendar_event_id", ""],
         ["booked_slot_label", ""],
+        ["inspection_slot", ""],
       ]);
 
       await sendWhatsAppMessage(
