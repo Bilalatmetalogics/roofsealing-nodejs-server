@@ -183,12 +183,6 @@ async function fetchAvailableSlots(token) {
   }
 
   const booked = evRes.data.items || [];
-  console.log(`[slots] calendar returned ${booked.length} existing events:`);
-  booked.forEach((ev) => {
-    console.log(
-      `[slots]   event: "${ev.summary}" start=${ev.start?.dateTime || ev.start?.date} end=${ev.end?.dateTime || ev.end?.date}`,
-    );
-  });
   const slots = [];
 
   for (const day of days) {
