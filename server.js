@@ -203,7 +203,12 @@ async function fetchAvailableSlots(token) {
           ev.end?.dateTime ||
           (ev.end?.date ? ev.end.date + "T00:00:00Z" : null);
         if (!s || !e) return false;
-        return s < end && e > start;
+        // Convert to timestamps for correct comparison regardless of timezone offset format
+        const evStart = new Date(s).getTime();
+        const evEnd = new Date(e).getTime();
+        const slotStart = new Date(start).getTime();
+        const slotEnd = new Date(end).getTime();
+        return evStart < slotEnd && evEnd > slotStart;
       });
       if (!busy)
         slots.push({ label: buildSlotLabel(day, hour, GLOBAL_TZ), start, end });
