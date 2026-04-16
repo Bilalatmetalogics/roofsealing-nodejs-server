@@ -95,9 +95,8 @@ async function deleteCalendarEvent(eventId, token) {
 }
 
 // ─── Slot calculation helpers ─────────────────────────────────────────────────
-const GLOBAL_TZ = "Asia/Dubai";
+const GLOBAL_TZ = "Asia/Dubai"; // Gulf Standard Time (UTC+4)
 const SLOT_HOURS = [10, 11, 12, 13, 14, 15, 16];
-const CALENDAR_TZ = "Asia/Karachi"; // GMT+5 — must match the Google Calendar's timezone setting
 
 function getWorkingDays(tz, count) {
   const days = [],
@@ -118,7 +117,10 @@ function getWorkingDays(tz, count) {
 }
 
 function toUTC(dateStr, hour, tz) {
-  const approx = new Date(`${dateStr}T${String(hour).padStart(2, "0")}:00:00Z`);
+  // Build a local time string and resolve it to UTC via the given timezone.
+  // e.g. "2025-04-20", hour=12, tz="Asia/Dubai" → "2025-04-20T08:00:00.000Z"
+  const localStr = `${dateStr}T${String(hour).padStart(2, "0")}:00:00`;
+  // Temporal-style: use a throwaway date to find the UTC offset for this tz at this moment
   const parts = {};
   new Intl.DateTimeFormat("en-US", {
     timeZone: tz,
@@ -130,12 +132,25 @@ function toUTC(dateStr, hour, tz) {
     second: "2-digit",
     hour12: false,
   })
-    .formatToParts(approx)
+    .formatToParts(
+      new Date(`${dateStr}T${String(hour).padStart(2, "0")}:00:00Z`),
+    )
     .forEach(({ type, value }) => (parts[type] = value));
-  const localAsUTC = new Date(
+
+  // `parts` tells us what local time corresponds to that UTC instant.
+  // We want the inverse: treat localStr as local, find the UTC instant.
+  // Offset = UTC_instant - local_instant (in ms)
+  const utcGuess = new Date(
+    `${dateStr}T${String(hour).padStart(2, "0")}:00:00Z`,
+  );
+  const localAtGuess = new Date(
     `${parts.year}-${parts.month}-${parts.day}T${parts.hour === "24" ? "00" : parts.hour}:${parts.minute}:${parts.second}Z`,
   );
-  return new Date(approx.getTime() - (localAsUTC - approx)).toISOString();
+  const offsetMs = utcGuess.getTime() - localAtGuess.getTime();
+
+  // Local time as a pseudo-UTC timestamp, then shift by offset
+  const localAsMs = new Date(`${localStr}Z`).getTime();
+  return new Date(localAsMs + offsetMs).toISOString();
 }
 
 function buildSlotLabel(dateStr, hour, tz) {
