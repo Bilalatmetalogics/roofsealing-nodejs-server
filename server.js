@@ -117,10 +117,15 @@ function getWorkingDays(tz, count) {
 }
 
 function toUTC(dateStr, hour, tz) {
-  // Build a local time string and resolve it to UTC via the given timezone.
-  // e.g. "2025-04-20", hour=12, tz="Asia/Dubai" → "2025-04-20T08:00:00.000Z"
-  const localStr = `${dateStr}T${String(hour).padStart(2, "0")}:00:00`;
-  // Temporal-style: use a throwaway date to find the UTC offset for this tz at this moment
+  // Convert a local date+hour in the given timezone to a UTC ISO string.
+  // Strategy: treat the local time as UTC (a "fake UTC"), then measure how far
+  // off the timezone's wall-clock is from UTC at that moment, and correct for it.
+  // This works correctly for fixed-offset zones like Asia/Dubai (UTC+4).
+  const fakeUTC = new Date(
+    `${dateStr}T${String(hour).padStart(2, "0")}:00:00Z`,
+  );
+
+  // Ask Intl what wall-clock time this UTC instant corresponds to in `tz`
   const parts = {};
   new Intl.DateTimeFormat("en-US", {
     timeZone: tz,
@@ -132,25 +137,21 @@ function toUTC(dateStr, hour, tz) {
     second: "2-digit",
     hour12: false,
   })
-    .formatToParts(
-      new Date(`${dateStr}T${String(hour).padStart(2, "0")}:00:00Z`),
-    )
+    .formatToParts(fakeUTC)
     .forEach(({ type, value }) => (parts[type] = value));
 
-  // `parts` tells us what local time corresponds to that UTC instant.
-  // We want the inverse: treat localStr as local, find the UTC instant.
-  // Offset = UTC_instant - local_instant (in ms)
-  const utcGuess = new Date(
-    `${dateStr}T${String(hour).padStart(2, "0")}:00:00Z`,
-  );
-  const localAtGuess = new Date(
-    `${parts.year}-${parts.month}-${parts.day}T${parts.hour === "24" ? "00" : parts.hour}:${parts.minute}:${parts.second}Z`,
-  );
-  const offsetMs = utcGuess.getTime() - localAtGuess.getTime();
+  // Build the local wall-clock as a pseudo-UTC ms value
+  const h = parts.hour === "24" ? "00" : parts.hour;
+  const localWallMs = new Date(
+    `${parts.year}-${parts.month}-${parts.day}T${h}:${parts.minute}:${parts.second}Z`,
+  ).getTime();
 
-  // Local time as a pseudo-UTC timestamp, then shift by offset
-  const localAsMs = new Date(`${localStr}Z`).getTime();
-  return new Date(localAsMs + offsetMs).toISOString();
+  // offsetMs = how many ms ahead the timezone is vs UTC
+  // e.g. Asia/Dubai is UTC+4, so localWallMs - fakeUTC.getTime() = +4h in ms
+  const offsetMs = localWallMs - fakeUTC.getTime();
+
+  // The real UTC instant = fakeUTC shifted back by the offset
+  return new Date(fakeUTC.getTime() - offsetMs).toISOString();
 }
 
 function buildSlotLabel(dateStr, hour, tz) {
